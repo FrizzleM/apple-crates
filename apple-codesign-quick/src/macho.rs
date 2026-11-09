@@ -915,8 +915,10 @@ fn arch_alignment(path: &Path, align: u32) -> Result<usize> {
         .ok_or_else(|| CodeSignError::macho(path, format!("invalid fat arch alignment {align}")))
 }
 
+// SideInstaller, 2026-11-01: `tests` and `minimal_macho_with_empty_signature`
+// are visible to the crate, for a test in bundle.rs.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::signature::{CSMAGIC_EMBEDDED_SIGNATURE, CmsSigningRequest};
 
@@ -1058,7 +1060,7 @@ mod tests {
         ));
     }
 
-    fn minimal_macho_with_empty_signature() -> Vec<u8> {
+    pub(crate) fn minimal_macho_with_empty_signature() -> Vec<u8> {
         let sizeofcmds = 72 + 72 + 16;
         let dataoff = 512usize;
         let mut data = vec![0; dataoff];

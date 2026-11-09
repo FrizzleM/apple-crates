@@ -182,7 +182,15 @@ impl Bundle {
 
     fn sub_bundles(&self) -> Result<Vec<PathBuf>> {
         let mut bundles = Vec::new();
-        for folder in ["Frameworks", "PlugIns"] {
+        // SideInstaller, 2026-11-01: Extensions too, where ExtensionKit app
+        // extensions live, but only its .appex folders. Anything else in it
+        // stays sealed as plain files, as it was before.
+        let folders = [
+            ("Frameworks", None),
+            ("PlugIns", None),
+            ("Extensions", Some("appex")),
+        ];
+        for (folder, extension) in folders {
             let dir = self.path.join(folder);
             if !dir.exists() {
                 continue;
@@ -196,6 +204,8 @@ impl Bundle {
                     .map_err(|source| CodeSignError::io(&path, source))?
                     .is_dir()
                     && path.join("Info.plist").exists()
+                    && extension
+                        .is_none_or(|wanted| path.extension().is_some_and(|ext| ext == wanted))
                 {
                     bundles.push(path);
                 }
@@ -607,6 +617,99 @@ mod tests {
                 .contains_key("PlugIns/Widget.appex/Info.plist")
         );
         assert!(parent.files2.contains_key("PlugIns/Widget.appex/PkgInfo"));
+    }
+
+    /// SideInstaller: an ExtensionKit extension in Extensions gets a signature
+    /// of its own, with the profile and entitlements listed for its bundle ID,
+    /// and the app seals it as it seals one in PlugIns. Before, its files were
+    /// sealed as the app's own and its executable was never signed. A bundle
+    /// in Extensions that isn't an .appex is still sealed as plain files.
+    #[test]
+    fn signs_app_extensions_in_extensions() {
+        let root = std::env::temp_dir().join(format!(
+            "apple-codesign-extensionkit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let write_bundle = |relative: &str, bundle_id: &str, executable: Option<&str>| {
+            let path = root.join(relative);
+            fs::create_dir_all(&path).unwrap();
+            let mut info = Dictionary::new();
+            info.insert("CFBundleIdentifier".to_string(), bundle_id.into());
+            if let Some(executable) = executable {
+                info.insert("CFBundleExecutable".to_string(), executable.into());
+                let macho = crate::macho::tests::minimal_macho_with_empty_signature();
+                fs::write(path.join(executable), macho).unwrap();
+            }
+            plist::to_file_xml(path.join("Info.plist"), &info).unwrap();
+        };
+        write_bundle("", "com.example.app", Some("App"));
+        write_bundle("PlugIns/Widget.appex", "com.example.app.Widget", Some("Widget"));
+        write_bundle("Extensions/Kit.appex", "com.example.app.Kit", Some("Kit"));
+        write_bundle("Extensions/Strings.bundle", "org.example.Strings", None);
+
+        let entitlements = |bundle_id: &str| {
+            let mut entitlements = Dictionary::new();
+            let app_id = format!("TEAMID.{bundle_id}");
+            entitlements.insert("application-identifier".to_string(), app_id.into());
+            entitlements
+        };
+        let profile = b"extension profile".as_slice();
+        let mut settings =
+            BundleSigningSettings::new("TEAMID", entitlements("com.example.app"), None);
+        for bundle_id in ["com.example.app.Widget", "com.example.app.Kit"] {
+            settings
+                .entitlements_by_bundle_id
+                .insert(bundle_id.to_string(), entitlements(bundle_id));
+            settings
+                .embedded_mobileprovisions_by_bundle_id
+                .insert(bundle_id.to_string(), profile);
+        }
+        sign_bundle(&root, &settings).unwrap();
+
+        let kit = root.join("Extensions/Kit.appex");
+        let kit_executable = fs::read(kit.join("Kit")).unwrap();
+        let contains = |needle: &[u8]| {
+            kit_executable
+                .windows(needle.len())
+                .any(|window| window == needle)
+        };
+        assert!(contains(b"com.example.app.Kit\0"), "Kit isn't signed as itself");
+        assert!(contains(b"<string>TEAMID.com.example.app.Kit</string>"));
+        assert_eq!(fs::read(kit.join("embedded.mobileprovision")).unwrap(), profile);
+        assert!(kit.join("_CodeSignature/CodeResources").is_file());
+
+        let sealed: Dictionary =
+            plist::from_file(root.join("_CodeSignature/CodeResources")).unwrap();
+        let files2 = sealed["files2"].as_dictionary().unwrap();
+        let sealed_sha256 = |relative: &str| {
+            files2
+                .get(relative)
+                .and_then(Value::as_dictionary)
+                .and_then(|entry| entry.get("hash2"))
+                .and_then(Value::as_data)
+                .map(<[u8]>::to_vec)
+        };
+        let signed_sha256: [u8; 32] = sha2::Sha256::digest(&kit_executable).into();
+        assert_eq!(
+            sealed_sha256("Extensions/Kit.appex/Kit"),
+            Some(signed_sha256.to_vec())
+        );
+        for relative in [
+            "Extensions/Kit.appex/Info.plist",
+            "Extensions/Kit.appex/embedded.mobileprovision",
+            "Extensions/Kit.appex/_CodeSignature/CodeResources",
+            "Extensions/Strings.bundle/Info.plist",
+            "PlugIns/Widget.appex/Widget",
+        ] {
+            assert!(files2.contains_key(relative), "{relative} isn't sealed");
+        }
+        assert!(!root.join("Extensions/Strings.bundle/_CodeSignature").exists());
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
